@@ -1,0 +1,3 @@
+<div id="faith-tts-widget" class="faith-tts-widget">
+  <div id="faith-tts-caption" class="faith-tts-caption" aria-live="polite"></div>
+</div>

@@ -1,0 +1,289 @@
+(() => {
+  'use strict';
+
+  const DEFAULTS = {
+    rewardId: '',
+    rewardTitle: 'Faith TTS',
+    acceptAnyChannelPointRedemption: false,
+    debugMode: true,
+    maxCharacters: 180,
+    captionSeconds: 7,
+    volume: 1
+  };
+
+  let settings = { ...DEFAULTS };
+  let audioContext = null;
+  let samLoadPromise = null;
+  let speaking = Promise.resolve();
+  const recentRedemptions = new Map();
+
+  function bool(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value === 'boolean') return value;
+    return ['true', '1', 'yes', 'on'].includes(String(value).toLowerCase());
+  }
+
+  function num(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function norm(value) {
+    return String(value || '').trim().toLowerCase();
+  }
+
+  function log(...args) {
+    if (settings.debugMode) console.log('[FAITH TTS]', ...args);
+  }
+
+  function warn(...args) {
+    console.warn('[FAITH TTS]', ...args);
+  }
+
+  function configure(fieldData = {}) {
+    settings = {
+      rewardId: String(fieldData.rewardId || DEFAULTS.rewardId).trim(),
+      rewardTitle: String(fieldData.rewardTitle || DEFAULTS.rewardTitle).trim(),
+      acceptAnyChannelPointRedemption: bool(fieldData.acceptAnyChannelPointRedemption, DEFAULTS.acceptAnyChannelPointRedemption),
+      debugMode: bool(fieldData.debugMode, DEFAULTS.debugMode),
+      maxCharacters: num(fieldData.maxCharacters, DEFAULTS.maxCharacters),
+      captionSeconds: num(fieldData.captionSeconds, DEFAULTS.captionSeconds),
+      volume: Math.max(0, Math.min(1, num(fieldData.volume, DEFAULTS.volume)))
+    };
+    log('settings loaded', settings);
+  }
+
+  function flatten(obj, out = [], seen = new Set()) {
+    if (!obj || typeof obj !== 'object' || seen.has(obj)) return out;
+    seen.add(obj);
+    if (Array.isArray(obj)) {
+      for (const value of obj) flatten(value, out, seen);
+      return out;
+    }
+    for (const [key, value] of Object.entries(obj)) {
+      out.push({ key, value });
+      if (value && typeof value === 'object') flatten(value, out, seen);
+    }
+    return out;
+  }
+
+  function firstStringByKeys(obj, keys) {
+    const wanted = keys.map(norm);
+    for (const { key, value } of flatten(obj)) {
+      if (!wanted.includes(norm(key))) continue;
+      if (typeof value === 'string' || typeof value === 'number') return String(value);
+      if (value && typeof value === 'object') {
+        for (const inner of ['id', '_id', 'title', 'name', 'displayName', 'display_name', 'prompt', 'label']) {
+          if (typeof value[inner] === 'string' || typeof value[inner] === 'number') return String(value[inner]);
+        }
+      }
+    }
+    return '';
+  }
+
+  function allTextValues(obj) {
+    return flatten(obj)
+      .filter(({ value }) => typeof value === 'string' || typeof value === 'number')
+      .map(({ value }) => String(value));
+  }
+
+  function isChannelPointRedemption(listener, event) {
+    const haystack = [listener, ...allTextValues(event)].map(norm).join(' | ');
+    return haystack.includes('channelpointsredemption') ||
+      haystack.includes('channel points redemption') ||
+      haystack.includes('channel-points') ||
+      haystack.includes('redemption-latest') ||
+      haystack.includes('reward-redeemed') ||
+      haystack.includes('custom-reward');
+  }
+
+  function firstRewardObject(event) {
+    for (const { key, value } of flatten(event)) {
+      if (!['reward', 'customReward', 'custom_reward', 'redemptionReward'].includes(String(key))) continue;
+      if (value && typeof value === 'object') return value;
+    }
+    return null;
+  }
+
+  function channelPointsLatestObject(obj) {
+    for (const { key, value } of flatten(obj)) {
+      if (String(key) === 'channel-points-latest' && value && typeof value === 'object') return value;
+    }
+    return null;
+  }
+
+  function stringFromObject(obj, keys) {
+    if (!obj || typeof obj !== 'object') return '';
+    for (const key of keys) {
+      const value = obj[key];
+      if (typeof value === 'string' || typeof value === 'number') return String(value);
+    }
+    return '';
+  }
+
+  function redemptionInfo(listener, event) {
+    const reward = firstRewardObject(event);
+    const channelPointsLatest = channelPointsLatestObject(event);
+    const rewardId = String(
+      reward?.id || reward?._id || reward?.rewardId || reward?.reward_id ||
+      firstStringByKeys(event, ['rewardId', 'reward_id', 'rewardID', 'redemptionRewardId', 'redemption_reward_id', 'channel_points_custom_reward_id']) || ''
+    );
+    const rewardTitle = String(
+      reward?.title || reward?.name || reward?.displayName || reward?.display_name || reward?.prompt || reward?.label ||
+      stringFromObject(channelPointsLatest, ['redemption']) ||
+      firstStringByKeys(event, ['rewardTitle', 'rewardName', 'reward_name', 'reward_title', 'title', 'redemption']) || ''
+    );
+    const input = stringFromObject(channelPointsLatest, ['message', 'user_input', 'input']) || firstStringByKeys(event, [
+      'input', 'userInput', 'user_input', 'redemptionInput', 'message', 'text', 'note', 'renderedText'
+    ]);
+    const type = firstStringByKeys(event, ['type', 'eventType', 'event_type']);
+    const channelPoint = isChannelPointRedemption(listener, event);
+    const idMatches = !!settings.rewardId && norm(rewardId) === norm(settings.rewardId);
+    const titleMatches = !!settings.rewardTitle && norm(rewardTitle) === norm(settings.rewardTitle);
+    const acceptedByDebugFallback = settings.acceptAnyChannelPointRedemption && channelPoint && !rewardId && !rewardTitle;
+    return {
+      listener,
+      type,
+      rewardId,
+      rewardTitle,
+      input,
+      channelPoint,
+      idMatches,
+      titleMatches,
+      acceptedByDebugFallback,
+      ok: channelPoint && (idMatches || titleMatches || acceptedByDebugFallback)
+    };
+  }
+
+  function cleanText(text) {
+    return String(text || '')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/https?:\/\/\S+/gi, ' link ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, Math.max(1, settings.maxCharacters));
+  }
+
+  function caption(text) {
+    const el = document.getElementById('faith-tts-caption');
+    if (!el) return;
+    el.textContent = text;
+    el.classList.add('show');
+    window.clearTimeout(caption._timer);
+    caption._timer = window.setTimeout(() => el.classList.remove('show'), settings.captionSeconds * 1000);
+  }
+
+  function getAudioContext() {
+    if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioContext.state === 'suspended') audioContext.resume();
+    return audioContext;
+  }
+
+  function loadSam() {
+    if (window.SamJs) return Promise.resolve(window.SamJs);
+    if (samLoadPromise) return samLoadPromise;
+    samLoadPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://unpkg.com/sam-js@0.3.1/dist/samjs.min.js';
+      script.onload = () => window.SamJs ? resolve(window.SamJs) : reject(new Error('SAM script loaded but window.SamJs is missing'));
+      script.onerror = () => reject(new Error('Failed to load sam-js CDN'));
+      document.head.appendChild(script);
+    });
+    return samLoadPromise;
+  }
+
+  async function playFallbackBeep() {
+    const ctx = getAudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 440;
+    gain.gain.value = settings.volume * 0.15;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    await new Promise(resolve => setTimeout(resolve, 350));
+    osc.stop();
+  }
+
+  async function speakSam(text) {
+    const ctx = getAudioContext();
+    try {
+      const SamJs = await loadSam();
+      const sam = new SamJs({ pitch: 75, speed: 75, mouth: 128, throat: 128 });
+      const buf8 = sam.buf8(text, false);
+      const buffer = ctx.createBuffer(1, buf8.length, 22050);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < buf8.length; i++) data[i] = ((buf8[i] - 128) / 128) * settings.volume;
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      await new Promise(resolve => {
+        source.onended = resolve;
+        source.start();
+      });
+    } catch (err) {
+      warn('SAM failed; using short beep fallback', err);
+      await playFallbackBeep();
+    }
+  }
+
+  function enqueueSpeak(text) {
+    const finalText = cleanText(text) || 'Faith T T S redeemed.';
+    log('speaking', finalText);
+    caption(finalText);
+    speaking = speaking.then(() => speakSam(finalText)).catch(err => warn('speak failed', err));
+    return speaking;
+  }
+
+  function alreadyHandled(info) {
+    const key = [info.rewardId, info.rewardTitle, info.input, info.type].map(norm).join('|');
+    const now = Date.now();
+    for (const [oldKey, time] of recentRedemptions) {
+      if (now - time > 10000) recentRedemptions.delete(oldKey);
+    }
+    if (recentRedemptions.has(key)) return true;
+    recentRedemptions.set(key, now);
+    return false;
+  }
+
+  function handleStreamElementsEvent(detail = {}) {
+    const listener = detail.listener || detail.event?.listener || '';
+    const event = detail.event || detail;
+    log('raw event received', { listener, event });
+
+    if (listener === 'event:test' || listener === 'test') {
+      enqueueSpeak('Faith T T S test event.');
+      return;
+    }
+
+    const info = redemptionInfo(listener, event);
+    log('redemption analysis', info);
+    if (!info.channelPoint) return;
+    if (!info.ok) {
+      log('redemption skipped', info);
+      return;
+    }
+    if (alreadyHandled(info)) {
+      log('duplicate redemption skipped', info);
+      return;
+    }
+    enqueueSpeak(info.input || 'Faith T T S redeemed.');
+  }
+
+  configure(DEFAULTS);
+
+  window.addEventListener('onWidgetLoad', event => {
+    configure(event?.detail?.fieldData || {});
+    log('widget loaded');
+  });
+
+  window.addEventListener('onEventReceived', event => {
+    handleStreamElementsEvent(event?.detail || {});
+  });
+
+  window.addEventListener('onSessionUpdate', event => {
+    handleStreamElementsEvent({ listener: 'channel-points-latest', event: event?.detail || {} });
+  });
+
+  window.faithTtsStatus = () => ({ settings, hasSam: !!window.SamJs, audioState: audioContext?.state || 'not-created' });
+  window.faithTtsTest = text => enqueueSpeak(text || 'Faith T T S manual test.');
+})();

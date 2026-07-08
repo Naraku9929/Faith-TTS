@@ -1,0 +1,29 @@
+.faith-tts-widget {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-bottom: 0;
+  pointer-events: none;
+  font-family: monospace;
+}
+
+.faith-tts-caption {
+  display: none;
+  max-width: 80vw;
+  padding: 18px 22px;
+  color: #ffffff;
+  background: rgba(0, 0, 0, 0.92);
+  border: 5px solid #ffffff;
+  box-shadow: 0 0 24px #000000;
+  text-transform: uppercase;
+  text-align: center;
+  font-size: 42px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.faith-tts-caption.show {
+  display: block;
+}
